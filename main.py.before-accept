@@ -1,0 +1,318 @@
+import json
+import os
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+from aiohttp import web
+from dotenv import load_dotenv
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+
+load_dotenv(dotenv_path=Path(".env"))
+
+
+def mask_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    return f"***{value[-4:]}"
+
+
+def truncate_text(value: str, limit: int = 500) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
+
+
+def filter_sdp_for_whatsapp(sdp: str) -> str:
+    lines = sdp.splitlines()
+    filtered = []
+    for line in lines:
+        if line.startswith("a=fingerprint:") and not line.startswith("a=fingerprint:sha-256"):
+            continue
+        filtered.append(line)
+    return "\r\n".join(filtered) + "\r\n"
+
+
+async def health(_: web.Request) -> web.Response:
+    return web.json_response({"ok": True})
+
+
+def get_safe_call_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    call_events = payload.get("callEvents")
+    if not isinstance(call_events, list):
+        return []
+
+    safe_events: list[dict[str, Any]] = []
+
+    for event in call_events:
+        if not isinstance(event, dict):
+            continue
+
+        safe_events.append(
+            {
+                "callId": event.get("callId"),
+                "event": event.get("event"),
+                "direction": event.get("direction"),
+                "phoneNumberId": event.get("phoneNumberId"),
+                "fromMasked": mask_id(event.get("from")),
+                "sdpPresent": bool(event.get("sdpPresent")),
+            }
+        )
+
+    return safe_events
+
+
+def execute_whatsapp_call_action(
+    *,
+    call_id: str,
+    action: str,
+    session: dict[str, Any] | None = None,
+    to: str | None = None,
+) -> dict[str, Any]:
+    token = os.getenv("WHATSAPP_ACCESS_TOKEN")
+    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+
+    if not token or not phone_number_id:
+        return {
+            "ok": False,
+            "status": None,
+            "bodyLength": 0,
+            "error": "missing_whatsapp_env",
+        }
+
+    body: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "call_id": call_id,
+        "action": action,
+    }
+
+    if to:
+        body["to"] = to
+
+    if session is not None:
+        body["session"] = session
+
+    encoded_body = json.dumps(body).encode("utf-8")
+    url = f"https://graph.facebook.com/v25.0/{phone_number_id}/calls"
+
+    req = urllib.request.Request(
+        url,
+        data=encoded_body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as res:
+            response_body = res.read().decode("utf-8", errors="replace")
+            return {
+                "ok": 200 <= res.status < 300,
+                "status": res.status,
+                "bodyLength": len(response_body),
+                "bodyPreview": truncate_text(response_body),
+            }
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "ok": False,
+            "status": exc.code,
+            "bodyLength": len(response_body),
+            "bodyPreview": truncate_text(response_body),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": None,
+            "bodyLength": 0,
+            "error": truncate_text(str(exc)),
+        }
+
+
+async def whatsapp_calls(request: web.Request) -> web.Response:
+    expected_secret = os.getenv("WHATSAPP_CALL_WORKER_SECRET")
+
+    if expected_secret:
+        received_secret = request.headers.get("X-FitCoach-Call-Worker-Secret")
+        if received_secret != expected_secret:
+            return web.json_response({"received": False, "error": "unauthorized"}, status=401)
+
+    payload = await request.json()
+    safe_events = get_safe_call_events(payload)
+
+    raw_calls = (
+        payload.get("payload", {})
+        .get("entry", [{}])[0]
+        .get("changes", [{}])[0]
+        .get("value", {})
+        .get("calls", [])
+    )
+
+    raw_call = raw_calls[0] if isinstance(raw_calls, list) and raw_calls else {}
+    raw_session = raw_call.get("session", {}) if isinstance(raw_call, dict) else {}
+    raw_sdp = raw_session.get("sdp") if isinstance(raw_session, dict) else None
+    raw_sdp_type = raw_session.get("sdp_type") if isinstance(raw_session, dict) else None
+    raw_from = raw_call.get("from") if isinstance(raw_call, dict) else None
+
+    print(
+        "[pipecat-worker] WhatsApp calls received",
+        {
+            "source": payload.get("source"),
+            "receivedAt": payload.get("receivedAt"),
+            "events": safe_events,
+        },
+        flush=True,
+    )
+
+    print(
+        "[pipecat-worker] WhatsApp raw SDP diagnostic",
+        {
+            "rawCallsDetected": len(raw_calls) if isinstance(raw_calls, list) else 0,
+            "sdpPresent": isinstance(raw_sdp, str) and len(raw_sdp) > 0,
+            "sdpLength": len(raw_sdp) if isinstance(raw_sdp, str) else 0,
+            "sdpType": raw_sdp_type,
+        },
+        flush=True,
+    )
+
+    connect_events = [
+        event
+        for event in safe_events
+        if event.get("event") == "connect"
+        and event.get("direction") == "USER_INITIATED"
+        and event.get("callId")
+    ]
+
+    print(
+        "[pipecat-worker] WhatsApp call action readiness",
+        {
+            "connectEventsDetected": len(connect_events),
+            "whatsappEnvConfigured": bool(os.getenv("WHATSAPP_ACCESS_TOKEN"))
+            and bool(os.getenv("WHATSAPP_PHONE_NUMBER_ID")),
+        },
+        flush=True,
+    )
+
+    if connect_events and isinstance(raw_sdp, str) and raw_sdp:
+        connection = SmallWebRTCConnection()
+        answer = None
+        try:
+            await connection.initialize(raw_sdp, raw_sdp_type or "offer")
+            answer = connection.get_answer()
+            print(
+                "[pipecat-worker] WhatsApp SDP answer diagnostic",
+                {
+                    "answerPresent": isinstance(answer, dict),
+                    "answerType": answer.get("type") if isinstance(answer, dict) else None,
+                    "answerSdpLength": len(answer.get("sdp", "")) if isinstance(answer, dict) else 0,
+                    "pcIdPresent": bool(answer.get("pc_id")) if isinstance(answer, dict) else False,
+                },
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                "[pipecat-worker] WhatsApp SDP answer failed",
+                {
+                    "errorType": type(exc).__name__,
+                    "error": str(exc)[:300],
+                },
+                flush=True,
+            )
+        finally:
+            await connection.cleanup()
+
+    handled = False
+
+    for event in connect_events:
+        call_id = event.get("callId")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+
+        if not isinstance(raw_sdp, str) or not raw_sdp:
+            print(
+                "[pipecat-worker] WhatsApp call pre_accept skipped",
+                {
+                    "callId": call_id,
+                    "reason": "missing_sdp_offer",
+                },
+                flush=True,
+            )
+            continue
+
+        connection = SmallWebRTCConnection()
+        answer = None
+
+        try:
+            await connection.initialize(raw_sdp, raw_sdp_type or "offer")
+            answer = connection.get_answer()
+        except Exception as exc:
+            print(
+                "[pipecat-worker] WhatsApp call pre_accept answer failed",
+                {
+                    "callId": call_id,
+                    "errorType": type(exc).__name__,
+                    "error": str(exc)[:300],
+                },
+                flush=True,
+            )
+            await connection.cleanup()
+            continue
+
+        if not isinstance(answer, dict) or not answer.get("sdp") or not answer.get("type"):
+            print(
+                "[pipecat-worker] WhatsApp call pre_accept skipped",
+                {
+                    "callId": call_id,
+                    "reason": "missing_sdp_answer",
+                },
+                flush=True,
+            )
+            await connection.cleanup()
+            continue
+
+        sdp_answer = filter_sdp_for_whatsapp(str(answer.get("sdp")))
+
+        result = execute_whatsapp_call_action(
+            call_id=call_id,
+            action="pre_accept",
+            to=raw_from if isinstance(raw_from, str) else None,
+            session={
+                "sdp_type": "answer",
+                "sdp": sdp_answer,
+            },
+        )
+
+        print(
+            "[pipecat-worker] WhatsApp call pre_accept completed",
+            {
+                "callId": call_id,
+                "ok": result.get("ok"),
+                "status": result.get("status"),
+                "bodyLength": result.get("bodyLength"),
+                "bodyPreview": result.get("bodyPreview"),
+                "error": result.get("error"),
+            },
+            flush=True,
+        )
+
+        if result.get("ok"):
+            handled = True
+        else:
+            await connection.cleanup()
+
+    return web.json_response({"received": True, "handled": handled})
+
+
+def create_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_post("/whatsapp/calls", whatsapp_calls)
+    return app
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "7860"))
+    web.run_app(create_app(), host="0.0.0.0", port=port)
