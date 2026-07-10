@@ -19,3 +19,4 @@ reply.wav
 hello.aiff
 
 *.log
+.env.local
