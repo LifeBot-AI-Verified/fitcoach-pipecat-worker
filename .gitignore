@@ -17,6 +17,7 @@ __pycache__/
 last_call_input.wav
 reply.wav
 hello.aiff
+hello_openai.meta.json
 
 *.log
 .env.local

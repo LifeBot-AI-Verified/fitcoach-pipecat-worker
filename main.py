@@ -29,6 +29,20 @@ openai_client = OpenAI()
 ACTIVE_CALL_CONNECTIONS: dict[str, SmallWebRTCConnection] = {}
 ACTIVE_CALL_AUDIO_TASKS: dict[str, asyncio.Task] = {}
 
+DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
+DEFAULT_OPENAI_TTS_VOICE = "coral"
+DEFAULT_OPENAI_TTS_INSTRUCTIONS = (
+    "Habla en español natural, con tono cercano, cálido y profesional. "
+    "Suena como una entrenadora personal por teléfono, no como un contestador. "
+    "Mantén un ritmo calmado y claro, con energía amable y no exagerada."
+)
+HELLO_OPENAI_WAV_PATH = Path("hello_openai.wav")
+HELLO_OPENAI_META_PATH = Path("hello_openai.meta.json")
+HELLO_OPENAI_TEXT = "Hola, soy FitCoach. ¿En qué puedo ayudarte?"
+HELLO_OPENAI_PREROLL_SECONDS = 0.4
+REPLY_PREROLL_SECONDS = 0.8
+SUPPORTED_TTS_WAV_SAMPLE_RATES = {24000, 48000}
+
 
 def mask_id(value: str | None) -> str | None:
     if not value:
@@ -40,6 +54,15 @@ def truncate_text(value: str, limit: int = 500) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "..."
+
+
+def get_env_value(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    value = value.strip()
+    return value or default
 
 
 def filter_sdp_for_whatsapp(sdp: str) -> str:
@@ -78,18 +101,35 @@ class BeepAudioTrack(AudioStreamTrack):
         return frame
 
 
-def generate_openai_tts_wav(text: str, path: str):
+def get_openai_tts_config() -> dict[str, str]:
+    return {
+        "model": get_env_value("OPENAI_TTS_MODEL", DEFAULT_OPENAI_TTS_MODEL),
+        "voice": get_env_value("OPENAI_TTS_VOICE", DEFAULT_OPENAI_TTS_VOICE),
+        "instructions": get_env_value("OPENAI_TTS_INSTRUCTIONS", DEFAULT_OPENAI_TTS_INSTRUCTIONS),
+    }
+
+
+def generate_openai_tts_wav(
+    text: str,
+    path: str | Path,
+    tts_config: dict[str, str] | None = None,
+):
+    tts_config = tts_config or get_openai_tts_config()
+
     with openai_client.audio.speech.with_streaming_response.create(
-        model=os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
-        voice=os.getenv("OPENAI_TTS_VOICE", "coral"),
+        model=tts_config["model"],
+        voice=tts_config["voice"],
+        instructions=tts_config["instructions"],
         input=text,
         response_format="wav",
     ) as response:
-        response.stream_to_file(path)
+        response.stream_to_file(str(path))
 
 
-def add_wav_preroll_silence(path: str, seconds: float = 0.8):
-    with wave.open(path, "rb") as src:
+def add_wav_preroll_silence(path: str | Path, seconds: float = REPLY_PREROLL_SECONDS):
+    wav_path = str(path)
+
+    with wave.open(wav_path, "rb") as src:
         channels = src.getnchannels()
         sample_width = src.getsampwidth()
         sample_rate = src.getframerate()
@@ -98,11 +138,74 @@ def add_wav_preroll_silence(path: str, seconds: float = 0.8):
     silence_frames = int(sample_rate * seconds)
     silence = b"\x00" * silence_frames * channels * sample_width
 
-    with wave.open(path, "wb") as dst:
+    with wave.open(wav_path, "wb") as dst:
         dst.setnchannels(channels)
         dst.setsampwidth(sample_width)
         dst.setframerate(sample_rate)
         dst.writeframes(silence + frames)
+
+
+def is_valid_tts_wav(path: str | Path) -> bool:
+    wav_path = Path(path)
+    if not wav_path.is_file():
+        return False
+
+    try:
+        with wave.open(str(wav_path), "rb") as src:
+            return (
+                src.getnchannels() >= 1
+                and src.getsampwidth() == 2
+                and src.getframerate() in SUPPORTED_TTS_WAV_SAMPLE_RATES
+                and src.getnframes() > 0
+            )
+    except (EOFError, OSError, wave.Error):
+        return False
+
+
+def get_hello_openai_metadata(tts_config: dict[str, str]) -> dict[str, str]:
+    return {
+        "text": HELLO_OPENAI_TEXT,
+        "model": tts_config["model"],
+        "voice": tts_config["voice"],
+        "instructions": tts_config["instructions"],
+    }
+
+
+def hello_openai_metadata_matches(expected_metadata: dict[str, str]) -> bool:
+    try:
+        metadata = json.loads(HELLO_OPENAI_META_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    if not isinstance(metadata, dict):
+        return False
+
+    return all(metadata.get(key) == value for key, value in expected_metadata.items())
+
+
+def write_hello_openai_metadata(metadata: dict[str, str]):
+    HELLO_OPENAI_META_PATH.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def ensure_hello_openai_wav() -> str:
+    tts_config = get_openai_tts_config()
+    expected_metadata = get_hello_openai_metadata(tts_config)
+
+    if is_valid_tts_wav(HELLO_OPENAI_WAV_PATH) and hello_openai_metadata_matches(expected_metadata):
+        return str(HELLO_OPENAI_WAV_PATH)
+
+    generate_openai_tts_wav(HELLO_OPENAI_TEXT, HELLO_OPENAI_WAV_PATH, tts_config=tts_config)
+    add_wav_preroll_silence(HELLO_OPENAI_WAV_PATH, seconds=HELLO_OPENAI_PREROLL_SECONDS)
+
+    if not is_valid_tts_wav(HELLO_OPENAI_WAV_PATH):
+        raise ValueError(f"Generated invalid greeting WAV: {HELLO_OPENAI_WAV_PATH}")
+
+    write_hello_openai_metadata(expected_metadata)
+
+    return str(HELLO_OPENAI_WAV_PATH)
 
 
 class WavAudioTrack(AudioStreamTrack):
@@ -343,7 +446,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                 )
 
             generate_openai_tts_wav(reply_text, "reply.wav")
-            add_wav_preroll_silence("reply.wav", seconds=0.8)
+            add_wav_preroll_silence("reply.wav", seconds=REPLY_PREROLL_SECONDS)
 
             print(
                 "[pipecat-worker] WhatsApp reply wav generated",
@@ -351,7 +454,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                     "callId": call_id,
                     "path": "reply.wav",
                     "replyLength": len(reply_text),
-                    "prerollSilenceSeconds": 0.8,
+                    "prerollSilenceSeconds": REPLY_PREROLL_SECONDS,
                 },
                 flush=True,
             )
@@ -747,9 +850,8 @@ async def whatsapp_calls(request: web.Request) -> web.Response:
         )
 
         if accept_result.get("ok"):
-            generate_openai_tts_wav("Hola, soy FitCoach. Te escucho.", "hello_openai.wav")
-            add_wav_preroll_silence("hello_openai.wav", seconds=0.4)
-            connection.replace_audio_track(WavAudioTrack("hello_openai.wav"))
+            hello_wav_path = ensure_hello_openai_wav()
+            connection.replace_audio_track(WavAudioTrack(hello_wav_path))
             ACTIVE_CALL_CONNECTIONS[call_id] = connection
             ACTIVE_CALL_AUDIO_TASKS[call_id] = asyncio.create_task(
                 monitor_audio_input(
@@ -762,7 +864,7 @@ async def whatsapp_calls(request: web.Request) -> web.Response:
                 "[pipecat-worker] WhatsApp wav audio track attached",
                 {
                     "callId": call_id,
-                    "path": "hello_openai.wav",
+                    "path": hello_wav_path,
                     "activeConnections": len(ACTIVE_CALL_CONNECTIONS),
                     "audioInputMonitorStarted": True,
                 },
