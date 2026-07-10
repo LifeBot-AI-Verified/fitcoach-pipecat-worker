@@ -32,9 +32,20 @@ ACTIVE_CALL_AUDIO_TASKS: dict[str, asyncio.Task] = {}
 DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
 DEFAULT_OPENAI_TTS_VOICE = "coral"
 DEFAULT_OPENAI_TTS_INSTRUCTIONS = (
-    "Habla en español natural, con tono cercano, cálido y profesional. "
-    "Suena como una entrenadora personal por teléfono, no como un contestador. "
-    "Mantén un ritmo calmado y claro, con energía amable y no exagerada."
+    "Habla en español natural y neutro, con tono claro y cercano. "
+    "Mantén ritmo normal de conversación telefónica. "
+    "No sobreactúes, no alargues las palabras y no fuerces acentos ni emociones."
+)
+FITCOACH_VOICE_REPLY_SYSTEM_PROMPT = (
+    "Eres FitCoach AI, una entrenadora personal y nutricional por voz. "
+    "Responde siempre en español natural, claro y cercano. "
+    "El texto se leerá en una llamada, así que usa frases cortas, directas y fáciles de escuchar. "
+    "Evita tablas, markdown, listas largas y tono de guion. "
+    "Si das pasos o ejercicios, agrúpalos en pocas indicaciones. "
+    "Mantén la respuesta breve; apunta a unas 80-100 palabras salvo que el usuario pida detalle. "
+    "Si el usuario pide una rutina, da una propuesta concreta con ejercicios, series o tiempo, descanso "
+    "e intensidad aproximada. Mantén claridad fitness y seguridad: si menciona dolor, lesión, embarazo, "
+    "mareo o una condición médica, baja la intensidad y recomienda consultar a un profesional."
 )
 HELLO_OPENAI_WAV_PATH = Path("hello_openai.wav")
 HELLO_OPENAI_META_PATH = Path("hello_openai.meta.json")
@@ -206,6 +217,23 @@ def ensure_hello_openai_wav() -> str:
     write_hello_openai_metadata(expected_metadata)
 
     return str(HELLO_OPENAI_WAV_PATH)
+
+
+def build_fitcoach_voice_reply_input(user_text: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "system",
+            "content": FITCOACH_VOICE_REPLY_SYSTEM_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": user_text,
+        },
+    ]
+
+
+def build_whatsapp_recap_text(reply_text: str) -> str:
+    return "Te dejo por escrito lo que hemos hablado en la llamada:\n\n" + reply_text
 
 
 class WavAudioTrack(AudioStreamTrack):
@@ -388,22 +416,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
         if text.strip():
             response = openai_client.responses.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-                input=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Eres FitCoach AI, un entrenador personal y nutricional por voz. "
-                            "Responde siempre en español, con tono cercano, claro y seguro. "
-                            "Como esto se leerá en una llamada, usa frases cortas y naturales. "
-                            "Si el usuario pide una rutina, da una propuesta concreta y breve. "
-                            "No uses tablas ni formato largo."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": text.strip(),
-                    },
-                ],
+                input=build_fitcoach_voice_reply_input(text.strip()),
             )
 
             reply_text = getattr(response, "output_text", "") or ""
@@ -421,7 +434,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
             Path("last_reply.txt").write_text(reply_text, encoding="utf-8")
 
             if raw_from:
-                recap_text = "Te dejo por escrito lo que hemos hablado en la llamada:\n\n" + reply_text
+                recap_text = build_whatsapp_recap_text(reply_text)
                 recap_result = send_whatsapp_text_message(to=raw_from, text=recap_text)
 
                 print(
