@@ -479,67 +479,56 @@ class WavAudioTrack(AudioStreamTrack):
         return frame
 
 
-async def capture_user_utterance(
+class SilenceAudioTrack(AudioStreamTrack):
+    kind = "audio"
+
+    def __init__(self, sample_rate: int = 48000):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.samples_per_frame = 960
+        self.sample_index = 0
+
+    async def recv(self):
+        await asyncio.sleep(self.samples_per_frame / self.sample_rate)
+
+        chunk = np.zeros(self.samples_per_frame, dtype=np.int16)
+        frame = av.AudioFrame.from_ndarray(chunk.reshape(1, -1), format="s16", layout="mono")
+        frame.sample_rate = self.sample_rate
+        frame.pts = self.sample_index
+        frame.time_base = fractions.Fraction(1, self.sample_rate)
+
+        self.sample_index += self.samples_per_frame
+        return frame
+
+
+def get_mono_samples_from_frame(frame: av.AudioFrame) -> np.ndarray | None:
+    ndarray = frame.to_ndarray()
+
+    if ndarray.size == 0:
+        return None
+
+    raw_samples = ndarray.astype(np.int16).reshape(-1)
+
+    if getattr(frame, "layout", None) and str(frame.layout) == "<av.AudioLayout 'stereo'>":
+        return raw_samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
+
+    return raw_samples
+
+
+def get_samples_rms_and_peak(samples: np.ndarray) -> tuple[float, float]:
+    samples_float = samples.astype(np.float32)
+    rms = float(np.sqrt(np.mean(samples_float * samples_float)))
+    peak = float(np.max(np.abs(samples_float)))
+    return rms, peak
+
+
+def transcribe_captured_audio(
     *,
     call_id: str,
-    audio_track: Any,
-    wav_path: str = "last_call_input.wav",
-    sample_rate: int = 48000,
-    voice_threshold: float = 700.0,
-    max_voice_frames: int = 250,
-    pre_speech_frames: int = 25,
+    captured_chunks: list[np.ndarray],
+    wav_path: str,
+    sample_rate: int,
 ) -> str | None:
-    captured_chunks = []
-    rolling_chunks = []
-    capturing = False
-    voice_frames = 0
-    frame_count = 0
-
-    while True:
-        frame = await audio_track.recv()
-        ndarray = frame.to_ndarray()
-
-        if ndarray.size == 0:
-            continue
-
-        raw_samples = ndarray.astype(np.int16).reshape(-1)
-
-        if getattr(frame, "layout", None) and str(frame.layout) == "<av.AudioLayout 'stereo'>":
-            samples = raw_samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
-        else:
-            samples = raw_samples
-
-        samples_float = samples.astype(np.float32)
-        rms = float(np.sqrt(np.mean(samples_float * samples_float)))
-        peak = float(np.max(np.abs(samples_float)))
-
-        frame_count += 1
-
-        rolling_chunks.append(samples.copy())
-        if len(rolling_chunks) > pre_speech_frames:
-            rolling_chunks.pop(0)
-
-        if not capturing and rms > voice_threshold:
-            capturing = True
-            captured_chunks.extend(rolling_chunks)
-            print(
-                "[pipecat-worker] WhatsApp speech capture started",
-                {
-                    "callId": call_id,
-                    "frameCount": frame_count,
-                    "rms": round(rms, 2),
-                    "peak": round(peak, 2),
-                },
-                flush=True,
-            )
-
-        if capturing:
-            captured_chunks.append(samples.copy())
-            voice_frames += 1
-
-            if voice_frames >= max_voice_frames:
-                break
-
     if not captured_chunks:
         print(
             "[pipecat-worker] WhatsApp speech capture empty",
@@ -589,6 +578,173 @@ async def capture_user_utterance(
     return text.strip() or None
 
 
+async def capture_user_utterance(
+    *,
+    call_id: str,
+    audio_track: Any,
+    wav_path: str = "last_call_input.wav",
+    sample_rate: int = 48000,
+    voice_threshold: float = 700.0,
+    max_voice_frames: int = 250,
+    pre_speech_frames: int = 25,
+) -> str | None:
+    captured_chunks = []
+    rolling_chunks = []
+    capturing = False
+    voice_frames = 0
+    frame_count = 0
+
+    while True:
+        frame = await audio_track.recv()
+        samples = get_mono_samples_from_frame(frame)
+        if samples is None:
+            continue
+
+        rms, peak = get_samples_rms_and_peak(samples)
+
+        frame_count += 1
+
+        rolling_chunks.append(samples.copy())
+        if len(rolling_chunks) > pre_speech_frames:
+            rolling_chunks.pop(0)
+
+        if not capturing and rms > voice_threshold:
+            capturing = True
+            captured_chunks.extend(rolling_chunks)
+            print(
+                "[pipecat-worker] WhatsApp speech capture started",
+                {
+                    "callId": call_id,
+                    "frameCount": frame_count,
+                    "rms": round(rms, 2),
+                    "peak": round(peak, 2),
+                },
+                flush=True,
+            )
+
+        if capturing:
+            captured_chunks.append(samples.copy())
+            voice_frames += 1
+
+            if voice_frames >= max_voice_frames:
+                break
+
+    return transcribe_captured_audio(
+        call_id=call_id,
+        captured_chunks=captured_chunks,
+        wav_path=wav_path,
+        sample_rate=sample_rate,
+    )
+
+
+async def wait_for_reply_or_interruption(
+    *,
+    call_id: str,
+    connection: SmallWebRTCConnection,
+    audio_track: Any,
+    reply_duration_seconds: float,
+    wav_path: str = "last_call_input.wav",
+    sample_rate: int = 48000,
+    voice_threshold: float = 700.0,
+    max_voice_frames: int = 250,
+    pre_speech_frames: int = 25,
+    interruption_voice_frames: int = 3,
+) -> str | None:
+    print(
+        "[pipecat-worker] WhatsApp reply playback monitoring started",
+        {
+            "callId": call_id,
+            "durationSeconds": round(reply_duration_seconds, 2),
+        },
+        flush=True,
+    )
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + reply_duration_seconds + 0.5
+    rolling_chunks = []
+    loud_frames = 0
+    frame_count = 0
+
+    while loop.time() < deadline:
+        frame = await audio_track.recv()
+        samples = get_mono_samples_from_frame(frame)
+        if samples is None:
+            continue
+
+        frame_count += 1
+        rolling_chunks.append(samples.copy())
+        if len(rolling_chunks) > pre_speech_frames:
+            rolling_chunks.pop(0)
+
+        rms, peak = get_samples_rms_and_peak(samples)
+        if rms > voice_threshold:
+            loud_frames += 1
+        else:
+            loud_frames = 0
+
+        if loud_frames < interruption_voice_frames:
+            continue
+
+        print(
+            "[pipecat-worker] WhatsApp reply playback interrupted",
+            {
+                "callId": call_id,
+                "frameCount": frame_count,
+                "rms": round(rms, 2),
+                "peak": round(peak, 2),
+            },
+            flush=True,
+        )
+
+        connection.replace_audio_track(SilenceAudioTrack())
+        captured_chunks = list(rolling_chunks)
+        silent_frames_after_speech = 0
+
+        while len(captured_chunks) < max_voice_frames:
+            frame = await audio_track.recv()
+            samples = get_mono_samples_from_frame(frame)
+            if samples is None:
+                continue
+            captured_chunks.append(samples.copy())
+
+            rms, _ = get_samples_rms_and_peak(samples)
+            if rms > voice_threshold:
+                silent_frames_after_speech = 0
+            else:
+                silent_frames_after_speech += 1
+
+            if silent_frames_after_speech >= pre_speech_frames:
+                break
+
+        interrupted_text = transcribe_captured_audio(
+            call_id=call_id,
+            captured_chunks=captured_chunks,
+            wav_path=wav_path,
+            sample_rate=sample_rate,
+        )
+
+        print(
+            "[pipecat-worker] WhatsApp interruption transcribed",
+            {
+                "callId": call_id,
+                "textPresent": bool(interrupted_text),
+                "textPreview": (interrupted_text or "")[:160],
+            },
+            flush=True,
+        )
+        return interrupted_text
+
+    print(
+        "[pipecat-worker] WhatsApp reply playback completed",
+        {
+            "callId": call_id,
+            "durationSeconds": round(reply_duration_seconds, 2),
+        },
+        flush=True,
+    )
+    return None
+
+
 async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, raw_from: str | None = None):
     wav_path = "last_call_input.wav"
     sample_rate = 48000
@@ -616,6 +772,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
 
         conversation_history: list[dict[str, str]] = []
         turn_index = 0
+        pending_user_text: str | None = None
 
         while True:
             print(
@@ -628,15 +785,19 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                 flush=True,
             )
 
-            user_text = await capture_user_utterance(
-                call_id=call_id,
-                audio_track=audio_track,
-                wav_path=wav_path,
-                sample_rate=sample_rate,
-                voice_threshold=voice_threshold,
-                max_voice_frames=max_voice_frames,
-                pre_speech_frames=pre_speech_frames,
-            )
+            if pending_user_text:
+                user_text = pending_user_text
+                pending_user_text = None
+            else:
+                user_text = await capture_user_utterance(
+                    call_id=call_id,
+                    audio_track=audio_track,
+                    wav_path=wav_path,
+                    sample_rate=sample_rate,
+                    voice_threshold=voice_threshold,
+                    max_voice_frames=max_voice_frames,
+                    pre_speech_frames=pre_speech_frames,
+                )
 
             if not user_text:
                 await asyncio.sleep(0.25)
@@ -725,7 +886,19 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                     },
                     flush=True,
                 )
-                await asyncio.sleep(reply_duration_seconds + 0.5)
+                interrupted_text = await wait_for_reply_or_interruption(
+                    call_id=call_id,
+                    connection=connection_for_reply,
+                    audio_track=audio_track,
+                    reply_duration_seconds=reply_duration_seconds,
+                    wav_path=wav_path,
+                    sample_rate=sample_rate,
+                    voice_threshold=voice_threshold,
+                    max_voice_frames=max_voice_frames,
+                    pre_speech_frames=pre_speech_frames,
+                )
+                if interrupted_text:
+                    pending_user_text = interrupted_text
             else:
                 print(
                     "[pipecat-worker] WhatsApp reply wav playback skipped",
