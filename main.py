@@ -38,14 +38,25 @@ DEFAULT_OPENAI_TTS_INSTRUCTIONS = (
 )
 FITCOACH_VOICE_REPLY_SYSTEM_PROMPT = (
     "Eres FitCoach AI, una entrenadora personal y nutricional por voz. "
-    "Responde siempre en español natural, claro y cercano. "
-    "El texto se leerá en una llamada, así que usa frases cortas, directas y fáciles de escuchar. "
-    "Evita tablas, markdown, listas largas y tono de guion. "
-    "Si das pasos o ejercicios, agrúpalos en pocas indicaciones. "
-    "Mantén la respuesta breve; apunta a unas 80-100 palabras salvo que el usuario pida detalle. "
-    "Si el usuario pide una rutina, da una propuesta concreta con ejercicios, series o tiempo, descanso "
-    "e intensidad aproximada. Mantén claridad fitness y seguridad: si menciona dolor, lesión, embarazo, "
-    "mareo o una condición médica, baja la intensidad y recomienda consultar a un profesional."
+    "Devuelve solo un objeto JSON valido con las claves spoken_reply y written_recap. "
+    "spoken_reply es para una llamada telefonica: debe ser breve, natural, claro y conversacional, "
+    "sin markdown, sin listas y normalmente en 1 a 3 frases. "
+    "written_recap es para WhatsApp: debe ser mas completo, util y estructurado en texto claro. "
+    "Si el usuario pide una rutina, spoken_reply debe resumir que se la preparas y que el detalle va por chat; "
+    "written_recap debe incluir ejercicios, series, repeticiones o tiempos, descansos, intensidad aproximada "
+    "y recomendaciones de seguridad cuando aplique. "
+    "Si menciona dolor, lesion, embarazo, mareo o una condicion medica, baja la intensidad en ambas respuestas "
+    "y recomienda consultar a un profesional. "
+    "No incluyas texto fuera del JSON."
+)
+FALLBACK_SPOKEN_REPLY = (
+    "Perdona, he tenido un problema preparando la respuesta completa. "
+    "Te dejo una recomendacion breve por el chat para que puedas seguir."
+)
+FALLBACK_WRITTEN_RECAP = (
+    "No he podido preparar el detalle completo esta vez. "
+    "Como recomendacion general, entrena con intensidad moderada, evita dolor o mareo, "
+    "y consulta con un profesional si tienes una lesion, condicion medica o dudas de seguridad."
 )
 HELLO_OPENAI_WAV_PATH = Path("hello_openai.wav")
 HELLO_OPENAI_META_PATH = Path("hello_openai.meta.json")
@@ -232,8 +243,78 @@ def build_fitcoach_voice_reply_input(user_text: str) -> list[dict[str, str]]:
     ]
 
 
-def build_whatsapp_recap_text(reply_text: str) -> str:
-    return "Te dejo por escrito lo que hemos hablado en la llamada:\n\n" + reply_text
+def parse_fitcoach_call_response(raw_text: str) -> dict[str, str]:
+    text = raw_text.strip()
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    parse_failed = False
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        json_start = text.find("{")
+        json_end = text.rfind("}")
+        if json_start != -1 and json_end > json_start:
+            try:
+                data = json.loads(text[json_start : json_end + 1])
+            except json.JSONDecodeError:
+                parse_failed = True
+                data = {}
+        else:
+            parse_failed = True
+            data = {}
+
+    if not isinstance(data, dict):
+        parse_failed = True
+        data = {}
+
+    spoken_reply = data.get("spoken_reply")
+    written_recap = data.get("written_recap")
+
+    if parse_failed or not isinstance(spoken_reply, str) or not spoken_reply.strip():
+        spoken_reply = FALLBACK_SPOKEN_REPLY
+
+    if not isinstance(written_recap, str) or not written_recap.strip():
+        written_recap = FALLBACK_WRITTEN_RECAP
+
+    return {
+        "spoken_reply": spoken_reply.strip(),
+        "written_recap": written_recap.strip(),
+    }
+
+
+def generate_fitcoach_call_response(user_text: str) -> dict[str, str]:
+    try:
+        response = openai_client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            input=build_fitcoach_voice_reply_input(user_text),
+        )
+    except Exception as exc:
+        print(
+            "[pipecat-worker] WhatsApp LLM response generation failed",
+            {
+                "errorType": type(exc).__name__,
+                "error": str(exc)[:500],
+            },
+            flush=True,
+        )
+        return {
+            "spoken_reply": FALLBACK_SPOKEN_REPLY,
+            "written_recap": FALLBACK_WRITTEN_RECAP,
+        }
+
+    return parse_fitcoach_call_response(getattr(response, "output_text", "") or "")
+
+
+def build_whatsapp_recap_text(written_recap: str) -> str:
+    return "Te dejo por escrito el detalle de la llamada:\n\n" + written_recap
 
 
 class WavAudioTrack(AudioStreamTrack):
@@ -414,27 +495,36 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
         )
 
         if text.strip():
-            response = openai_client.responses.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-                input=build_fitcoach_voice_reply_input(text.strip()),
-            )
-
-            reply_text = getattr(response, "output_text", "") or ""
+            call_response = generate_fitcoach_call_response(text.strip())
+            spoken_reply = call_response["spoken_reply"]
+            written_recap = call_response["written_recap"]
 
             print(
                 "[pipecat-worker] WhatsApp LLM reply generated",
                 {
                     "callId": call_id,
-                    "replyLength": len(reply_text),
-                    "replyPreview": reply_text[:220],
+                    "spokenReplyLength": len(spoken_reply),
+                    "writtenRecapLength": len(written_recap),
+                    "spokenReplyPreview": spoken_reply[:220],
                 },
                 flush=True,
             )
 
-            Path("last_reply.txt").write_text(reply_text, encoding="utf-8")
+            Path("last_reply.txt").write_text(
+                json.dumps(
+                    {
+                        "spoken_reply": spoken_reply,
+                        "written_recap": written_recap,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
             if raw_from:
-                recap_text = build_whatsapp_recap_text(reply_text)
+                recap_text = build_whatsapp_recap_text(written_recap)
                 recap_result = send_whatsapp_text_message(to=raw_from, text=recap_text)
 
                 print(
@@ -458,7 +548,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                     flush=True,
                 )
 
-            generate_openai_tts_wav(reply_text, "reply.wav")
+            generate_openai_tts_wav(spoken_reply, "reply.wav")
             add_wav_preroll_silence("reply.wav", seconds=REPLY_PREROLL_SECONDS)
 
             print(
@@ -466,7 +556,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                 {
                     "callId": call_id,
                     "path": "reply.wav",
-                    "replyLength": len(reply_text),
+                    "spokenReplyLength": len(spoken_reply),
                     "prerollSilenceSeconds": REPLY_PREROLL_SECONDS,
                 },
                 flush=True,
