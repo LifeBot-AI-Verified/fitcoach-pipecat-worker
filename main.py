@@ -3,6 +3,7 @@ import json
 import fractions
 import math
 import os
+import re
 import urllib.error
 import urllib.request
 import wave
@@ -40,11 +41,14 @@ FITCOACH_VOICE_REPLY_SYSTEM_PROMPT = (
     "Eres FitCoach AI, una entrenadora personal y nutricional por voz. "
     "Devuelve solo un objeto JSON valido con las claves spoken_reply y written_recap. "
     "spoken_reply es para una llamada telefonica: debe ser breve, natural, claro y conversacional, "
-    "sin markdown, sin listas y normalmente en 1 a 3 frases. "
+    "sin markdown y sin listas largas. Si das una rutina, spoken_reply debe ser una version hablada compacta "
+    "y util para seguir en llamada, no solo decir que lo dejas en el chat. "
     "written_recap es para WhatsApp: debe ser mas completo, util y estructurado en texto claro. "
-    "Si el usuario pide una rutina, spoken_reply debe resumir que se la preparas y que el detalle va por chat; "
+    "Si el usuario pide una rutina, spoken_reply debe cubrir los bloques principales en unos 45 a 90 segundos; "
     "written_recap debe incluir ejercicios, series, repeticiones o tiempos, descansos, intensidad aproximada "
     "y recomendaciones de seguridad cuando aplique. "
+    "Usa el historial de la llamada para entender ajustes como hacerlo mas corto, cambiar un ejercicio o adaptar material. "
+    "Si el usuario pide parar, responde brevemente que paras o que esperas nueva instruccion, sin crear una rutina nueva. "
     "Si menciona dolor, lesion, embarazo, mareo o una condicion medica, baja la intensidad en ambas respuestas "
     "y recomienda consultar a un profesional. "
     "No incluyas texto fuera del JSON."
@@ -64,6 +68,19 @@ HELLO_OPENAI_TEXT = "Hola, soy FitCoach. ¿En qué puedo ayudarte?"
 HELLO_OPENAI_PREROLL_SECONDS = 0.4
 REPLY_PREROLL_SECONDS = 0.8
 SUPPORTED_TTS_WAV_SAMPLE_RATES = {24000, 48000}
+MAX_CONVERSATION_HISTORY_TURNS = 6
+STOP_REQUEST_PHRASES = (
+    "parate",
+    "párate",
+    "detente",
+    "corta",
+    "córtalo",
+    "no sigas",
+    "callate",
+    "cállate",
+    "silencio",
+)
+STOP_REQUEST_EXACT_PHRASES = ("para",)
 
 
 def mask_id(value: str | None) -> str | None:
@@ -230,17 +247,52 @@ def ensure_hello_openai_wav() -> str:
     return str(HELLO_OPENAI_WAV_PATH)
 
 
-def build_fitcoach_voice_reply_input(user_text: str) -> list[dict[str, str]]:
-    return [
+def build_fitcoach_voice_reply_input(
+    user_text: str,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> list[dict[str, str]]:
+    input_messages = [
         {
             "role": "system",
             "content": FITCOACH_VOICE_REPLY_SYSTEM_PROMPT,
-        },
+        }
+    ]
+
+    for turn in (conversation_history or [])[-MAX_CONVERSATION_HISTORY_TURNS:]:
+        previous_user_text = turn.get("user_text", "")
+        previous_spoken_reply = turn.get("spoken_reply", "")
+        previous_written_recap = turn.get("written_recap", "")
+
+        if previous_user_text:
+            input_messages.append(
+                {
+                    "role": "user",
+                    "content": previous_user_text,
+                }
+            )
+
+        if previous_spoken_reply or previous_written_recap:
+            input_messages.append(
+                {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "spoken_reply": previous_spoken_reply,
+                            "written_recap": previous_written_recap,
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+
+    input_messages.append(
         {
             "role": "user",
             "content": user_text,
-        },
-    ]
+        }
+    )
+
+    return input_messages
 
 
 def parse_fitcoach_call_response(raw_text: str) -> dict[str, str]:
@@ -290,11 +342,43 @@ def parse_fitcoach_call_response(raw_text: str) -> dict[str, str]:
     }
 
 
-def generate_fitcoach_call_response(user_text: str) -> dict[str, str]:
+def is_stop_request(user_text: str) -> bool:
+    normalized_text = re.sub(r"[¡!¿?.,;:]+", " ", user_text.lower())
+    normalized_text = re.sub(r"\s+", " ", normalized_text).strip()
+
+    if re.fullmatch(r"(?:por favor )?para(?: (?:por favor|ya))?", normalized_text):
+        return True
+
+    if normalized_text in STOP_REQUEST_EXACT_PHRASES:
+        return True
+
+    return any(
+        re.fullmatch(rf"(?:por favor )?{re.escape(phrase)}(?: por favor)?", normalized_text)
+        for phrase in STOP_REQUEST_PHRASES
+    )
+
+
+def build_stop_call_response() -> dict[str, str]:
+    return {
+        "spoken_reply": "De acuerdo, paro. Me quedo esperando tu siguiente instruccion.",
+        "written_recap": (
+            "He parado la propuesta actual. Si quieres, puedes pedirme un ajuste concreto "
+            "o una nueva indicacion cuando te venga bien."
+        ),
+    }
+
+
+def generate_fitcoach_call_response(
+    user_text: str,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> dict[str, str]:
+    if is_stop_request(user_text):
+        return build_stop_call_response()
+
     try:
         response = openai_client.responses.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            input=build_fitcoach_voice_reply_input(user_text),
+            input=build_fitcoach_voice_reply_input(user_text, conversation_history),
         )
     except Exception as exc:
         print(
@@ -315,6 +399,29 @@ def generate_fitcoach_call_response(user_text: str) -> dict[str, str]:
 
 def build_whatsapp_recap_text(written_recap: str) -> str:
     return "Te dejo por escrito el detalle de la llamada:\n\n" + written_recap
+
+
+def get_wav_duration_seconds(path: str | Path) -> float:
+    with wave.open(str(path), "rb") as src:
+        sample_rate = src.getframerate()
+        if sample_rate <= 0:
+            return 0.0
+        return src.getnframes() / sample_rate
+
+
+def write_last_reply_debug(call_response: dict[str, str]):
+    Path("last_reply.txt").write_text(
+        json.dumps(
+            {
+                "spoken_reply": call_response["spoken_reply"],
+                "written_recap": call_response["written_recap"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 class WavAudioTrack(AudioStreamTrack):
@@ -372,6 +479,116 @@ class WavAudioTrack(AudioStreamTrack):
         return frame
 
 
+async def capture_user_utterance(
+    *,
+    call_id: str,
+    audio_track: Any,
+    wav_path: str = "last_call_input.wav",
+    sample_rate: int = 48000,
+    voice_threshold: float = 700.0,
+    max_voice_frames: int = 250,
+    pre_speech_frames: int = 25,
+) -> str | None:
+    captured_chunks = []
+    rolling_chunks = []
+    capturing = False
+    voice_frames = 0
+    frame_count = 0
+
+    while True:
+        frame = await audio_track.recv()
+        ndarray = frame.to_ndarray()
+
+        if ndarray.size == 0:
+            continue
+
+        raw_samples = ndarray.astype(np.int16).reshape(-1)
+
+        if getattr(frame, "layout", None) and str(frame.layout) == "<av.AudioLayout 'stereo'>":
+            samples = raw_samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
+        else:
+            samples = raw_samples
+
+        samples_float = samples.astype(np.float32)
+        rms = float(np.sqrt(np.mean(samples_float * samples_float)))
+        peak = float(np.max(np.abs(samples_float)))
+
+        frame_count += 1
+
+        rolling_chunks.append(samples.copy())
+        if len(rolling_chunks) > pre_speech_frames:
+            rolling_chunks.pop(0)
+
+        if not capturing and rms > voice_threshold:
+            capturing = True
+            captured_chunks.extend(rolling_chunks)
+            print(
+                "[pipecat-worker] WhatsApp speech capture started",
+                {
+                    "callId": call_id,
+                    "frameCount": frame_count,
+                    "rms": round(rms, 2),
+                    "peak": round(peak, 2),
+                },
+                flush=True,
+            )
+
+        if capturing:
+            captured_chunks.append(samples.copy())
+            voice_frames += 1
+
+            if voice_frames >= max_voice_frames:
+                break
+
+    if not captured_chunks:
+        print(
+            "[pipecat-worker] WhatsApp speech capture empty",
+            {"callId": call_id},
+            flush=True,
+        )
+        return None
+
+    audio = np.concatenate(captured_chunks).astype(np.int16)
+
+    with wave.open(wav_path, "wb") as dst:
+        dst.setnchannels(1)
+        dst.setsampwidth(2)
+        dst.setframerate(sample_rate)
+        dst.writeframes(audio.tobytes())
+
+    print(
+        "[pipecat-worker] WhatsApp speech wav saved",
+        {
+            "callId": call_id,
+            "path": wav_path,
+            "samples": int(audio.size),
+            "seconds": round(audio.size / sample_rate, 2),
+        },
+        flush=True,
+    )
+
+    with open(wav_path, "rb") as audio_file:
+        transcription = openai_client.audio.transcriptions.create(
+            model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"),
+            file=audio_file,
+            language="es",
+        )
+
+    text = getattr(transcription, "text", "") or ""
+
+    print(
+        "[pipecat-worker] WhatsApp speech transcribed",
+        {
+            "callId": call_id,
+            "transcriptionLength": len(text),
+            "transcriptionPreview": text[:160],
+        },
+        flush=True,
+    )
+
+    return text.strip() or None
+
+
 async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, raw_from: str | None = None):
     wav_path = "last_call_input.wav"
     sample_rate = 48000
@@ -397,105 +614,36 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
             flush=True,
         )
 
-        captured_chunks = []
-        rolling_chunks = []
-        capturing = False
-        voice_frames = 0
-        frame_count = 0
+        conversation_history: list[dict[str, str]] = []
+        turn_index = 0
 
         while True:
-            frame = await audio_track.recv()
-            ndarray = frame.to_ndarray()
-
-            if ndarray.size == 0:
-                continue
-
-            raw_samples = ndarray.astype(np.int16).reshape(-1)
-
-            if getattr(frame, "layout", None) and str(frame.layout) == "<av.AudioLayout 'stereo'>":
-                samples = raw_samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
-            else:
-                samples = raw_samples
-
-            samples_float = samples.astype(np.float32)
-            rms = float(np.sqrt(np.mean(samples_float * samples_float)))
-            peak = float(np.max(np.abs(samples_float)))
-
-            frame_count += 1
-
-            rolling_chunks.append(samples.copy())
-            if len(rolling_chunks) > pre_speech_frames:
-                rolling_chunks.pop(0)
-
-            if not capturing and rms > voice_threshold:
-                capturing = True
-                captured_chunks.extend(rolling_chunks)
-                print(
-                    "[pipecat-worker] WhatsApp speech capture started",
-                    {
-                        "callId": call_id,
-                        "frameCount": frame_count,
-                        "rms": round(rms, 2),
-                        "peak": round(peak, 2),
-                    },
-                    flush=True,
-                )
-
-            if capturing:
-                captured_chunks.append(samples.copy())
-                voice_frames += 1
-
-                if voice_frames >= max_voice_frames:
-                    break
-
-        if not captured_chunks:
             print(
-                "[pipecat-worker] WhatsApp speech capture empty",
-                {"callId": call_id},
+                "[pipecat-worker] WhatsApp turn listening",
+                {
+                    "callId": call_id,
+                    "turnIndex": turn_index + 1,
+                    "historyTurns": len(conversation_history),
+                },
                 flush=True,
             )
-            return
 
-        audio = np.concatenate(captured_chunks).astype(np.int16)
-
-        with wave.open(wav_path, "wb") as dst:
-            dst.setnchannels(1)
-            dst.setsampwidth(2)
-            dst.setframerate(sample_rate)
-            dst.writeframes(audio.tobytes())
-
-        print(
-            "[pipecat-worker] WhatsApp speech wav saved",
-            {
-                "callId": call_id,
-                "path": wav_path,
-                "samples": int(audio.size),
-                "seconds": round(audio.size / sample_rate, 2),
-            },
-            flush=True,
-        )
-
-        with open(wav_path, "rb") as audio_file:
-            transcription = openai_client.audio.transcriptions.create(
-                model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"),
-                file=audio_file,
-                language="es",
+            user_text = await capture_user_utterance(
+                call_id=call_id,
+                audio_track=audio_track,
+                wav_path=wav_path,
+                sample_rate=sample_rate,
+                voice_threshold=voice_threshold,
+                max_voice_frames=max_voice_frames,
+                pre_speech_frames=pre_speech_frames,
             )
 
-        text = getattr(transcription, "text", "") or ""
+            if not user_text:
+                await asyncio.sleep(0.25)
+                continue
 
-        print(
-            "[pipecat-worker] WhatsApp speech transcribed",
-            {
-                "callId": call_id,
-                "transcriptionLength": len(text),
-                "transcriptionPreview": text[:160],
-            },
-            flush=True,
-        )
-
-        if text.strip():
-            call_response = generate_fitcoach_call_response(text.strip())
+            turn_index += 1
+            call_response = generate_fitcoach_call_response(user_text, conversation_history)
             spoken_reply = call_response["spoken_reply"]
             written_recap = call_response["written_recap"]
 
@@ -503,6 +651,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                 "[pipecat-worker] WhatsApp LLM reply generated",
                 {
                     "callId": call_id,
+                    "turnIndex": turn_index,
                     "spokenReplyLength": len(spoken_reply),
                     "writtenRecapLength": len(written_recap),
                     "spokenReplyPreview": spoken_reply[:220],
@@ -510,18 +659,16 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                 flush=True,
             )
 
-            Path("last_reply.txt").write_text(
-                json.dumps(
-                    {
-                        "spoken_reply": spoken_reply,
-                        "written_recap": written_recap,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
+            conversation_history.append(
+                {
+                    "user_text": user_text,
+                    "spoken_reply": spoken_reply,
+                    "written_recap": written_recap,
+                }
             )
+            conversation_history = conversation_history[-MAX_CONVERSATION_HISTORY_TURNS:]
+
+            write_last_reply_debug(call_response)
 
             if raw_from:
                 recap_text = build_whatsapp_recap_text(written_recap)
@@ -531,6 +678,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                     "[pipecat-worker] WhatsApp call recap message sent",
                     {
                         "callId": call_id,
+                        "turnIndex": turn_index,
                         "ok": recap_result.get("ok"),
                         "status": recap_result.get("status"),
                         "bodyLength": recap_result.get("bodyLength"),
@@ -543,6 +691,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                     "[pipecat-worker] WhatsApp call recap message skipped",
                     {
                         "callId": call_id,
+                        "turnIndex": turn_index,
                         "reason": "missing_raw_from",
                     },
                     flush=True,
@@ -550,13 +699,16 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
 
             generate_openai_tts_wav(spoken_reply, "reply.wav")
             add_wav_preroll_silence("reply.wav", seconds=REPLY_PREROLL_SECONDS)
+            reply_duration_seconds = get_wav_duration_seconds("reply.wav")
 
             print(
                 "[pipecat-worker] WhatsApp reply wav generated",
                 {
                     "callId": call_id,
+                    "turnIndex": turn_index,
                     "path": "reply.wav",
                     "spokenReplyLength": len(spoken_reply),
+                    "durationSeconds": round(reply_duration_seconds, 2),
                     "prerollSilenceSeconds": REPLY_PREROLL_SECONDS,
                 },
                 flush=True,
@@ -573,6 +725,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                     },
                     flush=True,
                 )
+                await asyncio.sleep(reply_duration_seconds + 0.5)
             else:
                 print(
                     "[pipecat-worker] WhatsApp reply wav playback skipped",
@@ -582,6 +735,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                     },
                     flush=True,
                 )
+                return
 
     except asyncio.CancelledError:
         print(
