@@ -39,15 +39,21 @@ DEFAULT_OPENAI_TTS_INSTRUCTIONS = (
 )
 FITCOACH_VOICE_REPLY_SYSTEM_PROMPT = (
     "Eres FitCoach AI, una entrenadora personal y nutricional por voz. "
-    "Devuelve solo un objeto JSON valido con las claves spoken_reply y written_recap. "
+    "Devuelve solo un objeto JSON valido con las claves spoken_reply, written_recap "
+    "y opcionalmente context_updates. "
     "spoken_reply es para una llamada telefonica: debe ser breve, natural, claro y conversacional, "
     "sin markdown y sin listas largas. Si das una rutina, spoken_reply debe ser una version hablada compacta "
     "y util para seguir en llamada, no solo decir que lo dejas en el chat. "
     "written_recap es para WhatsApp: debe ser mas completo, util y estructurado en texto claro. "
+    "context_updates, si aparece, debe ser un objeto con solo estas claves cuando haya datos nuevos: "
+    "goal, muscle_group, duration, level, equipment, place, limitations, preferences. "
     "Si el usuario pide una rutina, spoken_reply debe cubrir los bloques principales en unos 45 a 90 segundos; "
     "written_recap debe incluir ejercicios, series, repeticiones o tiempos, descansos, intensidad aproximada "
     "y recomendaciones de seguridad cuando aplique. "
-    "Usa el historial de la llamada para entender ajustes como hacerlo mas corto, cambiar un ejercicio o adaptar material. "
+    "Usa el historial y el contexto fitness actual de la llamada para entender ajustes como hacerlo mas corto, "
+    "cambiar un ejercicio o adaptar material. "
+    "Si faltan datos importantes para una rutina, haz como maximo una pregunta breve antes de proponer; "
+    "si la peticion ya trae suficiente informacion, responde directamente. "
     "Si el usuario pide parar, responde brevemente que paras o que esperas nueva instruccion, sin crear una rutina nueva. "
     "Si menciona dolor, lesion, embarazo, mareo o una condicion medica, baja la intensidad en ambas respuestas "
     "y recomienda consultar a un profesional. "
@@ -69,6 +75,16 @@ HELLO_OPENAI_PREROLL_SECONDS = 0.4
 REPLY_PREROLL_SECONDS = 0.8
 SUPPORTED_TTS_WAV_SAMPLE_RATES = {24000, 48000}
 MAX_CONVERSATION_HISTORY_TURNS = 6
+FITNESS_CONTEXT_FIELDS = {
+    "goal",
+    "muscle_group",
+    "duration",
+    "level",
+    "equipment",
+    "place",
+    "limitations",
+    "preferences",
+}
 STOP_REQUEST_PHRASES = (
     "parate",
     "párate",
@@ -250,6 +266,7 @@ def ensure_hello_openai_wav() -> str:
 def build_fitcoach_voice_reply_input(
     user_text: str,
     conversation_history: list[dict[str, str]] | None = None,
+    session_fitness_context: dict[str, str | list[str]] | None = None,
 ) -> list[dict[str, str]]:
     input_messages = [
         {
@@ -257,6 +274,17 @@ def build_fitcoach_voice_reply_input(
             "content": FITCOACH_VOICE_REPLY_SYSTEM_PROMPT,
         }
     ]
+
+    input_messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Contexto fitness actual de esta llamada, detectado en turnos previos. "
+                "Usalo solo si ayuda y actualizalo con context_updates cuando haya informacion nueva:\n"
+                + json.dumps(session_fitness_context or {}, ensure_ascii=False)
+            ),
+        }
+    )
 
     for turn in (conversation_history or [])[-MAX_CONVERSATION_HISTORY_TURNS:]:
         previous_user_text = turn.get("user_text", "")
@@ -295,7 +323,7 @@ def build_fitcoach_voice_reply_input(
     return input_messages
 
 
-def parse_fitcoach_call_response(raw_text: str) -> dict[str, str]:
+def parse_fitcoach_call_response(raw_text: str) -> dict[str, Any]:
     text = raw_text.strip()
 
     if text.startswith("```"):
@@ -329,6 +357,7 @@ def parse_fitcoach_call_response(raw_text: str) -> dict[str, str]:
 
     spoken_reply = data.get("spoken_reply")
     written_recap = data.get("written_recap")
+    context_updates = data.get("context_updates")
 
     if parse_failed or not isinstance(spoken_reply, str) or not spoken_reply.strip():
         spoken_reply = FALLBACK_SPOKEN_REPLY
@@ -336,10 +365,146 @@ def parse_fitcoach_call_response(raw_text: str) -> dict[str, str]:
     if not isinstance(written_recap, str) or not written_recap.strip():
         written_recap = FALLBACK_WRITTEN_RECAP
 
+    if not isinstance(context_updates, dict):
+        context_updates = {}
+
     return {
         "spoken_reply": spoken_reply.strip(),
         "written_recap": written_recap.strip(),
+        "context_updates": context_updates,
     }
+
+
+def normalize_fitness_context_value(value: Any) -> str | list[str] | None:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+
+    if isinstance(value, list):
+        normalized_items = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            normalized_item = item.strip()
+            if normalized_item:
+                normalized_items.append(normalized_item)
+        return normalized_items[:12] or None
+
+    return None
+
+
+def merge_fitness_context_values(
+    current_value: str | list[str] | None,
+    new_value: str | list[str],
+) -> str | list[str]:
+    if isinstance(new_value, str):
+        return new_value
+
+    existing_items = current_value if isinstance(current_value, list) else []
+    merged_items = list(existing_items)
+
+    for item in new_value:
+        if item not in merged_items:
+            merged_items.append(item)
+
+    return merged_items[:12]
+
+
+def update_session_fitness_context(
+    session_fitness_context: dict[str, str | list[str]],
+    context_updates: Any,
+) -> None:
+    if not isinstance(context_updates, dict):
+        return
+
+    for key, value in context_updates.items():
+        if not isinstance(key, str):
+            continue
+
+        normalized_key = key.strip().lower()
+        if normalized_key not in FITNESS_CONTEXT_FIELDS:
+            continue
+
+        normalized_value = normalize_fitness_context_value(value)
+        if normalized_value is None:
+            continue
+
+        session_fitness_context[normalized_key] = merge_fitness_context_values(
+            session_fitness_context.get(normalized_key),
+            normalized_value,
+        )
+
+
+def add_context_update(updates: dict[str, str | list[str]], key: str, value: str | list[str]) -> None:
+    normalized_value = normalize_fitness_context_value(value)
+    if normalized_value is None:
+        return
+
+    updates[key] = merge_fitness_context_values(updates.get(key), normalized_value)
+
+
+def infer_fitness_context_updates_from_user_text(user_text: str) -> dict[str, str | list[str]]:
+    text = user_text.lower()
+    updates: dict[str, str | list[str]] = {}
+
+    duration_match = re.search(r"\b(\d{1,3})\s*(?:minutos?|mins?|min)\b", text)
+    if duration_match:
+        add_context_update(updates, "duration", f"{duration_match.group(1)} minutos")
+
+    muscle_groups = {
+        "espalda": ("espalda",),
+        "piernas": ("piernas", "pierna"),
+        "pecho": ("pecho",),
+        "hombros": ("hombros", "hombro"),
+        "brazos": ("brazos", "brazo", "biceps", "bíceps", "triceps", "tríceps"),
+        "gluteos": ("gluteos", "glúteos", "gluteo", "glúteo"),
+        "abdomen": ("abdomen", "abdominales", "core"),
+    }
+    for muscle_group, aliases in muscle_groups.items():
+        if any(alias in text for alias in aliases):
+            add_context_update(updates, "muscle_group", muscle_group)
+            break
+
+    if any(phrase in text for phrase in ("en casa", "para casa", "desde casa", "casa")):
+        add_context_update(updates, "place", "casa")
+    elif "gimnasio" in text or "gym" in text:
+        add_context_update(updates, "place", "gimnasio")
+    elif any(phrase in text for phrase in ("exterior", "aire libre", "parque")):
+        add_context_update(updates, "place", "exterior")
+
+    if re.search(r"\b(?:sin|no tengo|no hay)\s+mancuernas\b", text):
+        add_context_update(updates, "equipment", "sin mancuernas")
+        add_context_update(updates, "preferences", ["sin mancuernas"])
+    elif "mancuernas" in text:
+        add_context_update(updates, "equipment", "mancuernas")
+
+    if "sin saltos" in text or "no puedo saltar" in text:
+        add_context_update(updates, "preferences", ["sin saltos", "bajo impacto"])
+    if "bajo impacto" in text:
+        add_context_update(updates, "preferences", ["bajo impacto"])
+
+    if any(phrase in text for phrase in ("mas facil", "más fácil", "facil", "fácil", "principiante")):
+        add_context_update(updates, "level", "principiante")
+    elif "intermedio" in text:
+        add_context_update(updates, "level", "intermedio")
+    elif "avanzado" in text:
+        add_context_update(updates, "level", "avanzado")
+
+    if any(phrase in text for phrase in ("perder grasa", "bajar grasa", "adelgazar")):
+        add_context_update(updates, "goal", "perder grasa")
+    elif any(phrase in text for phrase in ("ganar musculo", "ganar músculo", "hipertrofia")):
+        add_context_update(updates, "goal", "ganar músculo")
+    elif "fuerza" in text:
+        add_context_update(updates, "goal", "fuerza")
+    elif "movilidad" in text:
+        add_context_update(updates, "goal", "movilidad")
+    elif "cardio" in text:
+        add_context_update(updates, "goal", "cardio")
+
+    if re.search(r"\b(?:dolor|duele|lesion|lesión|embarazo|embarazada|mareo|mareado|mareada)\b", text):
+        add_context_update(updates, "limitations", [truncate_text(user_text, limit=180)])
+
+    return updates
 
 
 def is_stop_request(user_text: str) -> bool:
@@ -358,27 +523,33 @@ def is_stop_request(user_text: str) -> bool:
     )
 
 
-def build_stop_call_response() -> dict[str, str]:
+def build_stop_call_response() -> dict[str, Any]:
     return {
         "spoken_reply": "De acuerdo, paro. Me quedo esperando tu siguiente instruccion.",
         "written_recap": (
             "He parado la propuesta actual. Si quieres, puedes pedirme un ajuste concreto "
             "o una nueva indicacion cuando te venga bien."
         ),
+        "context_updates": {},
     }
 
 
 def generate_fitcoach_call_response(
     user_text: str,
     conversation_history: list[dict[str, str]] | None = None,
-) -> dict[str, str]:
+    session_fitness_context: dict[str, str | list[str]] | None = None,
+) -> dict[str, Any]:
     if is_stop_request(user_text):
         return build_stop_call_response()
 
     try:
         response = openai_client.responses.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            input=build_fitcoach_voice_reply_input(user_text, conversation_history),
+            input=build_fitcoach_voice_reply_input(
+                user_text,
+                conversation_history,
+                session_fitness_context,
+            ),
         )
     except Exception as exc:
         print(
@@ -392,6 +563,7 @@ def generate_fitcoach_call_response(
         return {
             "spoken_reply": FALLBACK_SPOKEN_REPLY,
             "written_recap": FALLBACK_WRITTEN_RECAP,
+            "context_updates": {},
         }
 
     return parse_fitcoach_call_response(getattr(response, "output_text", "") or "")
@@ -409,12 +581,16 @@ def get_wav_duration_seconds(path: str | Path) -> float:
         return src.getnframes() / sample_rate
 
 
-def write_last_reply_debug(call_response: dict[str, str]):
+def write_last_reply_debug(
+    call_response: dict[str, Any],
+    session_fitness_context: dict[str, str | list[str]] | None = None,
+):
     Path("last_reply.txt").write_text(
         json.dumps(
             {
                 "spoken_reply": call_response["spoken_reply"],
                 "written_recap": call_response["written_recap"],
+                "session_fitness_context": session_fitness_context or {},
             },
             ensure_ascii=False,
             indent=2,
@@ -771,6 +947,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
         )
 
         conversation_history: list[dict[str, str]] = []
+        session_fitness_context: dict[str, str | list[str]] = {}
         turn_index = 0
         pending_user_text: str | None = None
 
@@ -781,6 +958,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                     "callId": call_id,
                     "turnIndex": turn_index + 1,
                     "historyTurns": len(conversation_history),
+                    "fitnessContextFields": sorted(session_fitness_context.keys()),
                 },
                 flush=True,
             )
@@ -804,7 +982,16 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                 continue
 
             turn_index += 1
-            call_response = generate_fitcoach_call_response(user_text, conversation_history)
+            update_session_fitness_context(
+                session_fitness_context,
+                infer_fitness_context_updates_from_user_text(user_text),
+            )
+            call_response = generate_fitcoach_call_response(
+                user_text,
+                conversation_history,
+                session_fitness_context,
+            )
+            update_session_fitness_context(session_fitness_context, call_response.get("context_updates"))
             spoken_reply = call_response["spoken_reply"]
             written_recap = call_response["written_recap"]
 
@@ -816,6 +1003,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
                     "spokenReplyLength": len(spoken_reply),
                     "writtenRecapLength": len(written_recap),
                     "spokenReplyPreview": spoken_reply[:220],
+                    "fitnessContextFields": sorted(session_fitness_context.keys()),
                 },
                 flush=True,
             )
@@ -829,7 +1017,7 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
             )
             conversation_history = conversation_history[-MAX_CONVERSATION_HISTORY_TURNS:]
 
-            write_last_reply_debug(call_response)
+            write_last_reply_debug(call_response, session_fitness_context)
 
             if raw_from:
                 recap_text = build_whatsapp_recap_text(written_recap)
