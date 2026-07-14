@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import av
 from aiortc import AudioStreamTrack
+from aiortc.mediastreams import MediaStreamError
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -54,6 +55,8 @@ FITCOACH_VOICE_REPLY_SYSTEM_PROMPT = (
     "cambiar un ejercicio o adaptar material. "
     "Si faltan datos importantes para una rutina, haz como maximo una pregunta breve antes de proponer; "
     "si la peticion ya trae suficiente informacion, responde directamente. "
+    "Salvo cuando el usuario pida parar, termina spoken_reply con una invitacion breve y natural a seguir, "
+    "variando la frase para no sonar repetitivo, por ejemplo preguntando si quiere ajustar intensidad, tiempo o ejercicios. "
     "Si el usuario pide parar, responde brevemente que paras o que esperas nueva instruccion, sin crear una rutina nueva. "
     "Si menciona dolor, lesion, embarazo, mareo o una condicion medica, baja la intensidad en ambas respuestas "
     "y recomienda consultar a un profesional. "
@@ -451,6 +454,19 @@ def infer_fitness_context_updates_from_user_text(user_text: str) -> dict[str, st
     if duration_match:
         add_context_update(updates, "duration", f"{duration_match.group(1)} minutos")
 
+    written_duration_patterns = (
+        (r"\bdiez\s+minutos?\b", "10 minutos"),
+        (r"\bquince\s+minutos?\b", "15 minutos"),
+        (r"\bveinte\s+minutos?\b", "20 minutos"),
+        (r"\btreinta\s+minutos?\b", "30 minutos"),
+        (r"\bcuarenta\s+y\s+cinco\s+minutos?\b", "45 minutos"),
+        (r"\buna\s+hora\b", "60 minutos"),
+    )
+    for pattern, duration in written_duration_patterns:
+        if re.search(pattern, text):
+            add_context_update(updates, "duration", duration)
+            break
+
     muscle_groups = {
         "espalda": ("espalda",),
         "piernas": ("piernas", "pierna"),
@@ -501,7 +517,11 @@ def infer_fitness_context_updates_from_user_text(user_text: str) -> dict[str, st
     elif "cardio" in text:
         add_context_update(updates, "goal", "cardio")
 
-    if re.search(r"\b(?:dolor|duele|lesion|lesión|embarazo|embarazada|mareo|mareado|mareada)\b", text):
+    limitation_pattern = (
+        r"\b(?:dolor|duele|lesion|lesión|embarazo|embarazada|mareo|mareado|mareada|"
+        r"molestia|molesta|molesto|incómodo|incomodo|incomoda|incomodidad)\b"
+    )
+    if re.search(limitation_pattern, text):
         add_context_update(updates, "limitations", [truncate_text(user_text, limit=180)])
 
     return updates
@@ -1105,6 +1125,15 @@ async def monitor_audio_input(call_id: str, connection: SmallWebRTCConnection, r
             flush=True,
         )
         raise
+    except MediaStreamError as exc:
+        print(
+            "[pipecat-worker] WhatsApp audio input track ended",
+            {
+                "callId": call_id,
+                "errorType": type(exc).__name__,
+            },
+            flush=True,
+        )
     except Exception as exc:
         print(
             "[pipecat-worker] WhatsApp audio input STT monitor failed",
